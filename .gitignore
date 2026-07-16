@@ -1,7 +1,25 @@
-# Build artifacts / temp binaries
+# ---- Dependencies ----
+node_modules/
+
+# ---- Build artifacts & runtime binaries (agent) ----
 *.bak
 *_test.exe
 Forzer_test.exe
+# Compiled agents (build from source instead of committing binaries)
+agent/*.exe
 
-# dependencies
-node_modules/
+# ---- Runtime / OS junk ----
+*.pid
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ---- Secrets / env overrides (never commit real ones) ----
+.env
+.env.*
+*.local
+
+# ---- Editor / IDE ----
+.vscode/
+.idea/
+*.swp

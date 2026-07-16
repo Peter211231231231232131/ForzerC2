@@ -446,9 +446,9 @@
     return out;
   }
   function b64dec(s) {
-    var bin = atob(s), out = '';
-    for (var i = 0; i < bin.length; i++) out += bin.charCodeAt(i);
-    return out;
+    // atob already returns the decoded binary string; just use it directly.
+    try { return decodeURIComponent(escape(atob(s))); }
+    catch (e) { return atob(s); }
   }
   function termStart() {
     if (!activePeerId || termActive) return;

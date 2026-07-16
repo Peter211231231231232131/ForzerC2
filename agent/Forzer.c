@@ -111,6 +111,11 @@ typedef struct {
     HANDLE hProc;          /* child process handle */
     HANDLE hThread;        /* reader thread */
     CRITICAL_SECTION lock;
+    /* output ring buffer: reader thread appends, main loop drains+sends */
+    unsigned char outbuf[32768];
+    int outlen;
+    int exited;            /* reader saw child exit */
+    int exitrc;
 } term_session_t;
 
 static term_session_t g_term;
@@ -710,6 +715,7 @@ static void term_write_input(const char *data, int len) {
     if (!g_term.active || g_term.hInWrite == INVALID_HANDLE_VALUE) return;
     DWORD w;
     WriteFile(g_term.hInWrite, data, len, &w, NULL);
+    fprintf(stderr, "[term-input] wrote %lu bytes\n", w);
 }
 
 static void term_stop(void) {
@@ -736,7 +742,15 @@ static DWORD WINAPI term_reader_thread(LPVOID lp) {
     char tmp[4096];
     DWORD r;
     while (g_term.active && ReadFile(g_term.hOutRead, tmp, sizeof(tmp), &r, NULL) && r > 0) {
-        term_send("term-data", tmp, (int)r, -1);
+        EnterCriticalSection(&g_term.lock);
+        /* append into ring; drop if overflow (avoid deadlock) */
+        int space = (int)sizeof(g_term.outbuf) - g_term.outlen;
+        if (space > 0) {
+            int c = (int)r; if (c > space) c = space;
+            memcpy(g_term.outbuf + g_term.outlen, tmp, c);
+            g_term.outlen += c;
+        }
+        LeaveCriticalSection(&g_term.lock);
     }
     /* process exited */
     int rc = -1;
@@ -744,8 +758,37 @@ static DWORD WINAPI term_reader_thread(LPVOID lp) {
         DWORD code = 0;
         if (GetExitCodeProcess(g_term.hProc, &code)) rc = (int)code;
     }
-    term_send("term-exit", "", 0, rc);
+    EnterCriticalSection(&g_term.lock);
+    g_term.exited = 1;
+    g_term.exitrc = rc;
+    LeaveCriticalSection(&g_term.lock);
     g_term.active = 0;
+    return 0;
+}
+
+/* Called from the main thread (which owns the socket): drain buffered
+ * terminal output and relay it to the viewer. Returns 1 if a term-exit
+ * should be sent (child ended). */
+static int term_drain(void) {
+    if (!g_term.id[0]) return 0;
+    EnterCriticalSection(&g_term.lock);
+    int len = g_term.outlen;
+    int exited = g_term.exited;
+    int rc = g_term.exitrc;
+    if (len > 0) {
+        unsigned char buf[32768];
+        memcpy(buf, g_term.outbuf, len);
+        g_term.outlen = 0;
+        LeaveCriticalSection(&g_term.lock);
+        term_send("term-data", (char *)buf, len, -1);
+        return 0;
+    }
+    LeaveCriticalSection(&g_term.lock);
+    if (exited) {
+        term_send("term-exit", "", 0, rc);
+        g_term.id[0] = 0;
+        return 1;
+    }
     return 0;
 }
 
@@ -782,6 +825,10 @@ static int run_interactive(const char *to, const char *id) {
 
     memset(&g_term, 0, sizeof(g_term));
     g_term.active = 1;
+    InitializeCriticalSection(&g_term.lock);
+    g_term.outlen = 0;
+    g_term.exited = 0;
+    g_term.exitrc = -1;
     strncpy(g_term.id, id, sizeof(g_term.id) - 1);
     strncpy(g_term.to, to, sizeof(g_term.to) - 1);
     g_term.hInWrite = hInWrite;
@@ -1013,6 +1060,7 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
             break;
         }
         buf[n] = 0;
+        term_drain(); /* pump any buffered terminal output (main thread owns socket) */
         char type[32] = {0};
         json_str(buf, "type", type, sizeof(type));
         char from[64] = {0};
@@ -1072,7 +1120,7 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
             static unsigned char dec[22000];
             int dl = (int)strlen(data);
             int out = 0;
-            for (int i = 0; i + 3 < dl; i += 4) {
+            for (int i = 0; i + 3 <= dl; i += 4) {
                 int v = 0;
                 for (int k = 0; k < 4; k++) {
                     char c = data[i + k];
