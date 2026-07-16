@@ -97,6 +97,29 @@ static BYTE *g_tls_out = NULL; static int g_tls_out_len = 0, g_tls_out_off = 0;
 
 static int tr_send(const char *data, int len);
 static int tr_recv(char *out, int cap);
+
+/* ------------------------------------------------------------------ */
+/* Interactive terminal session (streaming shell to a viewer)         */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    int active;            /* 1 while a session is live */
+    char id[64];           /* session id from the viewer */
+    char to[64];           /* viewer id to route data back to */
+    HANDLE hInWrite;       /* child stdin write end (agent->child) */
+    HANDLE hOutRead;       /* child stdout/stderr read end */
+    HANDLE hProc;          /* child process handle */
+    HANDLE hThread;        /* reader thread */
+    CRITICAL_SECTION lock;
+} term_session_t;
+
+static term_session_t g_term;
+
+static DWORD WINAPI term_reader_thread(LPVOID lp);
+static void term_send(const char *kind, const char *data, int len, int rc);
+static int run_interactive(const char *to, const char *id);
+static void term_write_input(const char *data, int len);
+static void term_stop(void);
 static int tls_send(const char *data, int len);
 static int tls_recv(char *out, int cap);
 
@@ -628,6 +651,148 @@ static int run_command(const char *cmd, char *out, int cap) {
     return (int)code;
 }
 
+/* Send a terminal protocol frame back to the control plane. */
+static void term_send(const char *kind, const char *data, int len, int rc) {
+    /* Base64 the raw bytes so binary/CRLF survive the JSON transport. */
+    static char b64[44000];
+    int need = ((len + 2) / 3) * 4 + 1;
+    if (need > (int)sizeof(b64)) need = (int)sizeof(b64);
+    int n = 0;
+    if (len > 0) {
+        /* chunked base64 to bound stack usage */
+        char tmp[4096];
+        int done = 0;
+        while (done < len) {
+            int c = len - done; if (c > 3072) c = 3072;
+            char chunkb64[4100];
+            /* base64 of data+done..c */
+            int outi = 0;
+            const unsigned char *p = (const unsigned char *)data + done;
+            for (int i = 0; i + 2 < c; i += 3) {
+                unsigned v = (p[i] << 16) | (p[i+1] << 8) | p[i+2];
+                static const char t[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                chunkb64[outi++] = t[(v>>18)&63]; chunkb64[outi++] = t[(v>>12)&63];
+                chunkb64[outi++] = t[(v>>6)&63]; chunkb64[outi++] = t[v&63];
+            }
+            int rem = c - (c/3)*3;
+            if (rem == 1) {
+                unsigned v = p[c-1] << 16;
+                static const char t[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                chunkb64[outi++] = t[(v>>18)&63]; chunkb64[outi++] = t[(v>>12)&63];
+                chunkb64[outi++] = '='; chunkb64[outi++] = '=';
+            } else if (rem == 2) {
+                unsigned v = (p[c-2] << 16) | (p[c-1] << 8);
+                static const char t[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                chunkb64[outi++] = t[(v>>18)&63]; chunkb64[outi++] = t[(v>>12)&63];
+                chunkb64[outi++] = t[(v>>6)&63]; chunkb64[outi++] = '=';
+            }
+            if (n + outi >= need - 1) outi = (need - 1) - n;
+            memcpy(b64 + n, chunkb64, outi);
+            n += outi;
+            done += c;
+        }
+    }
+    b64[n] = 0;
+
+    char msg[45000];
+    if (rc >= 0)
+        snprintf(msg, sizeof(msg),
+            "{\"type\":\"%s\",\"to\":\"%s\",\"id\":\"%s\",\"data\":\"%s\",\"rc\":%d}",
+            kind, g_term.to, g_term.id, b64, rc);
+    else
+        snprintf(msg, sizeof(msg),
+            "{\"type\":\"%s\",\"to\":\"%s\",\"id\":\"%s\",\"data\":\"%s\"}",
+            kind, g_term.to, g_term.id, b64);
+    tr_send(msg, (int)strlen(msg));
+}
+
+static void term_write_input(const char *data, int len) {
+    if (!g_term.active || g_term.hInWrite == INVALID_HANDLE_VALUE) return;
+    DWORD w;
+    WriteFile(g_term.hInWrite, data, len, &w, NULL);
+}
+
+static void term_stop(void) {
+    if (!g_term.active) return;
+    g_term.active = 0;
+    /* Kill the child shell so reader thread drains and exits. */
+    if (g_term.hProc) {
+        HANDLE hp = OpenProcess(PROCESS_TERMINATE, FALSE, GetProcessId(g_term.hProc));
+        if (hp) { TerminateProcess(hp, 1); CloseHandle(hp); }
+    }
+    if (g_term.hThread) {
+        WaitForSingleObject(g_term.hThread, 2000);
+        CloseHandle(g_term.hThread);
+        g_term.hThread = NULL;
+    }
+    if (g_term.hInWrite != INVALID_HANDLE_VALUE) { CloseHandle(g_term.hInWrite); g_term.hInWrite = INVALID_HANDLE_VALUE; }
+    if (g_term.hOutRead != INVALID_HANDLE_VALUE) { CloseHandle(g_term.hOutRead); g_term.hOutRead = INVALID_HANDLE_VALUE; }
+    if (g_term.hProc) { CloseHandle(g_term.hProc); g_term.hProc = NULL; }
+    term_send("term-end", "", 0, 0);
+}
+
+static DWORD WINAPI term_reader_thread(LPVOID lp) {
+    (void)lp;
+    char tmp[4096];
+    DWORD r;
+    while (g_term.active && ReadFile(g_term.hOutRead, tmp, sizeof(tmp), &r, NULL) && r > 0) {
+        term_send("term-data", tmp, (int)r, -1);
+    }
+    /* process exited */
+    int rc = -1;
+    if (g_term.hProc) {
+        DWORD code = 0;
+        if (GetExitCodeProcess(g_term.hProc, &code)) rc = (int)code;
+    }
+    term_send("term-exit", "", 0, rc);
+    g_term.active = 0;
+    return 0;
+}
+
+/* Launch an interactive cmd.exe with redirected pipes and stream output. */
+static int run_interactive(const char *to, const char *id) {
+    if (g_term.active) term_stop();
+
+    HANDLE hInRead = INVALID_HANDLE_VALUE, hInWrite = INVALID_HANDLE_VALUE;
+    HANDLE hOutRead = INVALID_HANDLE_VALUE, hOutWrite = INVALID_HANDLE_VALUE;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    if (!CreatePipe(&hInRead, &hInWrite, &sa, 0)) return -1;
+    if (!CreatePipe(&hOutRead, &hOutWrite, &sa, 0)) {
+        CloseHandle(hInRead); CloseHandle(hInWrite); return -1;
+    }
+
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.hStdOutput = hOutWrite;
+    si.hStdError = hOutWrite;
+    si.hStdInput = hInRead;
+    si.dwFlags = STARTF_USESTDHANDLES;
+
+    if (!CreateProcessA(NULL, "cmd.exe", NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) {
+        CloseHandle(hInRead); CloseHandle(hInWrite);
+        CloseHandle(hOutRead); CloseHandle(hOutWrite);
+        return -1;
+    }
+    CloseHandle(hOutWrite);   /* child has its copy */
+    CloseHandle(hInRead);     /* child has its copy */
+    CloseHandle(pi.hThread);
+
+    memset(&g_term, 0, sizeof(g_term));
+    g_term.active = 1;
+    strncpy(g_term.id, id, sizeof(g_term.id) - 1);
+    strncpy(g_term.to, to, sizeof(g_term.to) - 1);
+    g_term.hInWrite = hInWrite;
+    g_term.hOutRead = hOutRead;
+    g_term.hProc = pi.hProcess;
+    g_term.hThread = CreateThread(NULL, 0, term_reader_thread, NULL, 0, NULL);
+
+    term_send("term-data", "", 0, -1); /* open the stream on the viewer side */
+    return 0;
+}
+
 /* Interactive prompt: type 'run <peer-id> <command>' to send. */
 static DWORD WINAPI reader_thread(LPVOID lp) {
     (void)lp;
@@ -888,6 +1053,44 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
                      from, id, esc, rc);
             tr_send(res, (int)strlen(res));
             printf("[command] done (rc=%d, %d bytes)\n", rc, (int)strlen(esc));
+        } else if (strcmp(type, "term-start") == 0) {
+            char id[64] = {0};
+            json_str(buf, "id", id, sizeof(id));
+            if (!g_allow_remote) {
+                printf("[term] REJECTED (remote exec disabled)\n");
+                continue;
+            }
+            printf("[term] start session %s\n", id);
+            if (run_interactive(from, id) != 0)
+                term_send("term-exit", "failed to start shell", (int)strlen("failed to start shell"), -1);
+        } else if (strcmp(type, "term-input") == 0) {
+            char data[32768] = {0};
+            json_str(buf, "data", data, sizeof(data));
+            /* data is base64 of the raw keystrokes */
+            static unsigned char dec[22000];
+            int dl = (int)strlen(data);
+            int out = 0;
+            for (int i = 0; i + 3 < dl; i += 4) {
+                int v = 0;
+                for (int k = 0; k < 4; k++) {
+                    char c = data[i + k];
+                    int val = -1;
+                    if (c >= 'A' && c <= 'Z') val = c - 'A';
+                    else if (c >= 'a' && c <= 'z') val = c - 'a' + 26;
+                    else if (c >= '0' && c <= '9') val = c - '0' + 52;
+                    else if (c == '+') val = 62;
+                    else if (c == '/') val = 63;
+                    else break; /* '=' padding */
+                    v = (v << 6) | val;
+                }
+                dec[out++] = (unsigned char)((v >> 16) & 0xff);
+                if (data[i+2] != '=') dec[out++] = (unsigned char)((v >> 8) & 0xff);
+                if (data[i+3] != '=') dec[out++] = (unsigned char)(v & 0xff);
+            }
+            term_write_input((char *)dec, out);
+        } else if (strcmp(type, "term-end") == 0) {
+            printf("[term] session ended by viewer\n");
+            term_stop();
         } else if (strcmp(type, "command-result") == 0) {
             char id[64] = {0}, data[32768] = {0}, rc[16] = {0};
             json_str(buf, "id", id, sizeof(id));
@@ -906,6 +1109,8 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
         CloseHandle(thr);
         thr = NULL;
     }
+
+    term_stop(); /* kill any live shell session on disconnect */
 
     /* Tear down the current socket before (re)connecting. */
     if (g_use_tls) {

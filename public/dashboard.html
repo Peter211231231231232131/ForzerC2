@@ -253,21 +253,27 @@
        </div>
      </section>
 
-     <!-- Per-peer command console (slides in from the right) -->
-     <div class="console" id="console">
-       <div class="console-head">
-         <div>
-           <h3 id="console-title">Peer</h3>
-           <div class="meta" id="console-meta"></div>
-         </div>
-         <button class="console-close" id="console-close" title="Close">&times;</button>
-       </div>
-       <div class="console-out" id="console-out"></div>
-       <div class="console-in">
-         <input id="console-input" type="text" placeholder="type a command and press Enter…" autocomplete="off" />
-         <button id="console-send">Run</button>
-       </div>
-     </div>
+      <!-- Per-peer command console (slides in from the right) -->
+      <div class="console" id="console">
+        <div class="console-head">
+          <div>
+            <h3 id="console-title">Peer</h3>
+            <div class="meta" id="console-meta"></div>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <button id="term-toggle" style="background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:6px 10px;cursor:pointer;font-size:12px;">Live Terminal</button>
+            <button class="console-close" id="console-close" title="Close">&times;</button>
+          </div>
+        </div>
+        <div class="console-out" id="console-out"></div>
+        <div class="console-in">
+          <input id="console-input" type="text" placeholder="type a command and press Enter…" autocomplete="off" />
+          <button id="console-send">Run</button>
+          <button id="term-ctrlc" style="display:none;background:var(--panel-2);border:1px solid var(--border);color:var(--warn);border-radius:8px;padding:0 12px;cursor:pointer;font-weight:600;">Ctrl-C</button>
+          <button id="term-end" style="display:none;background:var(--panel-2);border:1px solid var(--border);color:var(--danger);border-radius:8px;padding:0 12px;cursor:pointer;font-weight:600;">End</button>
+        </div>
+      </div>
+
 
 
     <section class="panel">
@@ -422,11 +428,84 @@
     }
   }
 
-  document.getElementById('console-send').addEventListener('click', sendCommand);
+  /* --------------------------- Live terminal --------------------------- */
+  var termActive = false;
+  var termId = null;
+  var b64chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  function b64enc(str) {
+    var out = '';
+    for (var i = 0; i < str.length; i += 3) {
+      var b0 = str.charCodeAt(i) & 0xff;
+      var b1 = i + 1 < str.length ? str.charCodeAt(i + 1) & 0xff : 0;
+      var b2 = i + 2 < str.length ? str.charCodeAt(i + 2) & 0xff : 0;
+      var v = (b0 << 16) | (b1 << 8) | b2;
+      out += b64chars[(v >> 18) & 63] + b64chars[(v >> 12) & 63];
+      out += i + 1 < str.length ? b64chars[(v >> 6) & 63] : '=';
+      out += i + 2 < str.length ? b64chars[v & 63] : '=';
+    }
+    return out;
+  }
+  function b64dec(s) {
+    var bin = atob(s), out = '';
+    for (var i = 0; i < bin.length; i++) out += bin.charCodeAt(i);
+    return out;
+  }
+  function termStart() {
+    if (!activePeerId || termActive) return;
+    termId = 't' + (++reqCounter) + '-' + Date.now().toString(36);
+    termActive = true;
+    consoleOut.innerHTML = '';
+    appendSys('starting live shell…');
+    document.getElementById('term-toggle').textContent = 'Terminal: ON';
+    document.getElementById('term-ctrlc').style.display = '';
+    document.getElementById('term-end').style.display = '';
+    consoleInput.placeholder = 'type into the shell (Enter sends \\n, Ctrl-C button to interrupt)';
+    if (ws && ws.readyState === 1)
+      ws.send(JSON.stringify({ type: 'term-start', to: activePeerId, id: termId }));
+  }
+  function termStop() {
+    if (!termActive) return;
+    termActive = false;
+    document.getElementById('term-toggle').textContent = 'Live Terminal';
+    document.getElementById('term-ctrlc').style.display = 'none';
+    document.getElementById('term-end').style.display = 'none';
+    consoleInput.placeholder = 'type a command and press Enter…';
+    if (ws && ws.readyState === 1 && termId)
+      ws.send(JSON.stringify({ type: 'term-end', to: activePeerId, id: termId }));
+    termId = null;
+  }
+  function termSendInput(text) {
+    if (!termActive || !ws || ws.readyState !== 1) return;
+    ws.send(JSON.stringify({ type: 'term-input', to: activePeerId, id: termId, data: b64enc(text) }));
+  }
+
+  function sendOrTerm() {
+    if (termActive) {
+      termSendInput(consoleInput.value + '\n');
+      consoleInput.value = '';
+    } else {
+      sendCommand();
+    }
+  }
+
+  document.getElementById('console-send').addEventListener('click', sendOrTerm);
   consoleInput.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') sendCommand();
+    if (e.key === 'Enter') { e.preventDefault(); sendOrTerm(); }
   });
-  document.getElementById('console-close').addEventListener('click', closeConsole);
+  document.getElementById('term-toggle').addEventListener('click', function () {
+    if (termActive) termStop(); else termStart();
+  });
+  document.getElementById('term-ctrlc').addEventListener('click', function () {
+    termSendInput('\u0003'); // Ctrl-C
+  });
+  document.getElementById('term-end').addEventListener('click', termStop);
+  document.getElementById('console-close').addEventListener('click', function () {
+    if (termActive) termStop();
+    activePeerId = null;
+    consoleEl.classList.remove('open');
+    markActive();
+  });
+
 
   var ws = null;
   var reconnectTimer = null;
@@ -475,6 +554,23 @@
             delete pending[msg.id];
             appendErr(msg.error || 'command failed');
           }
+        } else if (msg.type === 'term-data') {
+          // streaming shell output for the active session (base64 payload)
+          if (msg.id === termId && termActive) {
+            if (msg.data) appendResult(b64dec(msg.data));
+          }
+        } else if (msg.type === 'term-exit') {
+          if (msg.id === termId) {
+            appendSys('--- shell exited (rc=' + (msg.rc == null ? '?' : msg.rc) + ') ---');
+            termActive = false;
+            document.getElementById('term-toggle').textContent = 'Live Terminal';
+            document.getElementById('term-ctrlc').style.display = 'none';
+            document.getElementById('term-end').style.display = 'none';
+            consoleInput.placeholder = 'type a command and press Enter…';
+            termId = null;
+          }
+        } else if (msg.type === 'term-end') {
+          if (msg.id === termId) appendSys('--- session closed ---');
         }
       } catch (e) { /* ignore */ }
     };

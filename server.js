@@ -176,9 +176,10 @@ function handleRegister(ws, msg) {
 
 // Messages routed peer-to-peer by their "to" field. The "from" is
 // stamped by the server so a peer can't spoof the sender.
-const ROUTABLE = new Set(['signal', 'command', 'command-result']);
+const ROUTABLE = new Set(['signal', 'command', 'command-result',
+  'term-start', 'term-data', 'term-input', 'term-end', 'term-exit']);
 // Types a dashboard viewer is allowed to originate.
-const VIEWER_ROUTABLE = new Set(['command']);
+const VIEWER_ROUTABLE = new Set(['command', 'term-start', 'term-input', 'term-end']);
 
 function deliver(ws, payload) {
   if (ws && ws.readyState === 1) ws.send(payload);
@@ -200,8 +201,10 @@ function relay(ws, msg) {
       });
       target.ws.send(payload);
     }
-    // Echo command-result back to the dashboard viewer that asked, if any.
-    if (msg.type === 'command-result' && ws.commandViewer) {
+    // Echo command-result / terminal output back to the dashboard viewer
+    // that asked, if any.
+    const ECHO_TO_VIEWER = new Set(['command-result', 'term-data', 'term-exit', 'term-end']);
+    if (ECHO_TO_VIEWER.has(msg.type) && ws.commandViewer) {
       const v = [...viewers].find((x) => x.viewerId === ws.commandViewer);
       if (v && v.readyState === 1) {
         v.send(JSON.stringify({
@@ -213,7 +216,9 @@ function relay(ws, msg) {
           rc: typeof msg.rc === 'number' ? msg.rc : undefined,
         }));
       }
-      ws.commandViewer = null;
+      if (msg.type === 'command-result' || msg.type === 'term-exit' || msg.type === 'term-end') {
+        ws.commandViewer = null;
+      }
     }
     return;
   }
