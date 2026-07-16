@@ -540,17 +540,14 @@
           log('mesh update &middot; <b>' + (msg.peers ? msg.peers.length : 0) +
               '</b> peer(s) &middot; v' + msg.version);
         } else if (msg.type === 'command-result') {
-          // result routed back from a peer we asked (msg.to is our viewer id)
-          var pid = pending[msg.id];
-          if (pid && pid === activePeerId) {
+          if (pending[msg.id]) {
             delete pending[msg.id];
             var header = 'rc=' + (msg.rc == null ? '?' : msg.rc);
             appendSys('--- ' + header + ' ---');
             appendResult(msg.data || '');
           }
         } else if (msg.type === 'command-error') {
-          var eid = pending[msg.id];
-          if (eid && eid === activePeerId) {
+          if (pending[msg.id]) {
             delete pending[msg.id];
             appendErr(msg.error || 'command failed');
           }
