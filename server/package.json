@@ -1,0 +1,16 @@
+{
+  "name": "forzer-server",
+  "version": "0.1.0",
+  "description": "Forzer control plane - coordinates WireGuard mesh peers",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "license": "MIT"
+}

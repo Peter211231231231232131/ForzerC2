@@ -1,0 +1,7 @@
+# Build artifacts / temp binaries
+*.bak
+*_test.exe
+Forzer_test.exe
+
+# dependencies
+node_modules/

